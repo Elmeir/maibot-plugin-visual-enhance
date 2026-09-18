@@ -1,0 +1,7 @@
+# 视觉增强（visual-enhance）运行时依赖
+# 宿主会按 _manifest.json 的 dependencies 自动安装；本文件为手动安装兜底。
+# 安装：pip install -r requirements.txt
+Pillow>=10.0.0
+aiohttp>=3.8.0
+httpx>=0.27.0
+bilibili-api-python>=17.4.0
