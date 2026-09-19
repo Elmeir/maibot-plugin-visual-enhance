@@ -351,12 +351,14 @@ class AnimeSectionConfig(PluginConfigBase):
     filter_not_confident: bool = Field(
         default=True,
         description=(
-            "过滤低置信结果：跳过官方标记为 not_confident（候选过多、需人工确认）的"
-            "检测框——宁可缺判也不错判；关闭后低置信角色的最高候选也会写入"
+            "过滤低置信结果：存在高置信结果时跳过官方标记为 not_confident"
+            "（候选过多、需人工确认）的检测框——宁可缺判也不错判；全部为"
+            "低置信时兜底写入（带「（低置信）」后缀）；关闭后低置信检测框"
+            "始终写入"
         ),
         json_schema_extra={
             "label": "过滤低置信结果",
-            "hint": "跳过官方标记的低置信检测框",
+            "hint": "有高置信时丢弃低置信框；全低置信时带标注兜底",
         },
     )
     cache_enabled: bool = Field(
@@ -1095,7 +1097,7 @@ class StoryboardMixin:
                 self._anime_cache_put(orig_hash, info)
             else:
                 self.ctx.logger.info(
-                    "[动漫识别] 阻塞注入：接口无可用角色结果（可能非动漫图或全部低置信）hash=%s",
+                    "[动漫识别] 阻塞注入：接口无可用角色结果（可能非动漫图）hash=%s",
                     orig_hash[:12],
                 )
 
@@ -1292,7 +1294,7 @@ class StoryboardMixin:
         info = self._format_anime_info(boxes)
         if not info:
             self.ctx.logger.info(
-                "[动漫识别] 接口无可用角色结果（可能非动漫图或全部低置信）hash=%s",
+                "[动漫识别] 接口无可用角色结果（可能非动漫图）hash=%s",
                 frame_hash[:12],
             )
             return
@@ -1306,9 +1308,10 @@ class StoryboardMixin:
     async def _animetrace_search(self, image: bytes) -> Optional[List[Any]]:
         """调用 AnimeTrace 识图接口，返回人物检测框列表；失败返回 None。
 
-        接口为 multipart/form-data 上传（is_multi=0 时每个检测框只返回
-        最可能的候选）；业务码 0/200/17720/17721 均视为成功（官方文档
-        存在两代状态码体系）。
+        接口为 multipart/form-data 上传（is_multi=1 返回每个检测框的完整
+        候选列表，低置信框候选可能多达数十个，由 _format_anime_info 取前
+        N 个；is_multi=0 时每人只返回 1 个候选）；业务码 0/200/17720/17721
+        均视为成功（官方文档存在两代状态码体系）。
         """
         url = str(self._opt("anime", "api_url", ANIMETRACE_API_URL) or "").strip() or ANIMETRACE_API_URL
         try:
@@ -1318,7 +1321,7 @@ class StoryboardMixin:
         model = str(self._opt("anime", "model", "") or "").strip()
 
         form = aiohttp.FormData()
-        form.add_field("is_multi", "0")
+        form.add_field("is_multi", "1")
         if model:
             form.add_field("model", model)
         form.add_field("file", image, filename="frame.jpg", content_type="image/jpeg")
@@ -1355,9 +1358,10 @@ class StoryboardMixin:
     def _format_anime_info(self, boxes: Optional[List[Any]]) -> str:
         """把识图检测结果格式化为一行追加信息；无有效角色返回空串。
 
-        筛选：开启 filter_not_confident 时跳过官方标记为低置信（候选过多、
-        需人工确认）的检测框——宁可缺判也不错判；关闭过滤时低置信检测框
-        仍写入，但带「（低置信）」后缀标注，提示麦麦谨慎引用。
+        筛选：开启 filter_not_confident 时，存在高置信检测框则跳过官方标记
+        为低置信（候选过多、需人工确认）的检测框——宁可缺判也不错判；全部
+        为低置信时兜底写入（带「（低置信）」后缀标注）。关闭过滤时低置信
+        检测框始终写入并标注，提示麦麦谨慎引用。
         每个人物取按可能性排序的前 max_candidates 个候选，重复去重；
         人物数上限 max_characters。
 
@@ -1377,14 +1381,20 @@ class StoryboardMixin:
             max_candidates = 2
         filter_low = bool(self._opt("anime", "filter_not_confident", True))
         smart_filter = bool(self._opt("anime", "smart_filter", True))
+        # 条件过滤：存在高置信检测框时丢弃低置信框；全部低置信时兜底写入
+        usable = [
+            (box, bool(box.get("not_confident")))
+            for box in boxes
+            if isinstance(box, dict)
+            and isinstance(box.get("character"), list)
+            and box.get("character")
+        ]
+        drop_low = filter_low and any(not low for _, low in usable)
         people_candidates: List[List[tuple[str, str]]] = []
         people_low: List[bool] = []
         seen: "set[str]" = set()
-        for box in boxes:
-            if not isinstance(box, dict):
-                continue
-            low = bool(box.get("not_confident"))
-            if filter_low and low:
+        for box, low in usable:
+            if drop_low and low:
                 continue
             candidates = box.get("character")
             if not isinstance(candidates, list) or not candidates:
