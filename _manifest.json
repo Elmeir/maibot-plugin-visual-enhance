@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "2.0.0",
+  "version": "2.1.0",
   "id": "github.elmeir.visual-enhance",
   "name": "视觉增强",
   "description": "GIF 动图分镜、图片重看（含表情包）、B站/抖音视频理解三合一：动图按帧合成网格图交给视觉模型；描述不够时可带问题重新看图；视频链接自动附加信息与官方 AI 总结（需登录态）。纯插件实现，不改宿主代码。",

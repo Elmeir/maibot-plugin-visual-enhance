@@ -68,3 +68,19 @@ douyin_cookie = ""        # 抖音 Cookie（选填）：整串文本 k=v; k2=v2�
 
 [debug]
 enabled = false           # 调试日志总开关：开=三块能力的诊断信息（解析/识图/凭据失败原因等）以 INFO 输出；日常保持关闭
+
+# 以下为调试页「工具信息」只读展示段：内容由插件加载时自动写入（勿手改）
+[tool_inspect_image]
+visibility = ""
+description = ""
+parameters = ""
+
+[tool_parse_bilibili_video]
+visibility = ""
+description = ""
+parameters = ""
+
+[tool_parse_douyin_video]
+visibility = ""
+description = ""
+parameters = ""

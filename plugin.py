@@ -15,7 +15,9 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from maibot_sdk import Field, MaiBotPlugin, PluginConfigBase
 
@@ -50,6 +52,162 @@ class DebugSectionConfig(PluginConfigBase):
     )
 
 
+class ToolInfoBaseConfig(PluginConfigBase):
+    """工具信息基类（只读展示：LLM 视角的工具定义，加载时自动写入）。
+
+    WebUI 对字段的显示值取自配置值本身（schema.default 会被空配置值覆盖），
+    展示文本由 on_load 写入 config.toml 对应段；读取处忽略这些字段（纯展示）。
+    """
+
+    __ui_icon__ = "wrench"
+    __ui_order__ = 10
+
+    visibility: str = Field(
+        default="",
+        description="工具对 LLM 的可见性（运行时生成，只读）",
+        json_schema_extra={
+            "label": "可见性",
+            "hint": "deferred = 不在常驻工具列表（按需发现，可被 tool_search 搜到）；visible = 始终提供给 LLM",
+            "disabled": True,
+            "rows": 2,
+        },
+    )
+    description: str = Field(
+        default="",
+        description="LLM 看到的工具描述（运行时生成，只读）",
+        json_schema_extra={
+            "label": "描述",
+            "hint": "LLM 实际看到的工具描述；每次插件加载时自动刷新",
+            "disabled": True,
+            "rows": 5,
+        },
+    )
+    parameters: str = Field(
+        default="",
+        description="工具参数清单（运行时生成，只读）",
+        json_schema_extra={
+            "label": "参数",
+            "hint": "每个参数一行：名称（类型，必填/可选）：说明",
+            "disabled": True,
+            "rows": 5,
+        },
+    )
+
+
+class ToolInspectImageConfig(ToolInfoBaseConfig):
+    """图片重看工具（inspect_image）。"""
+
+    __ui_label__ = "inspect_image"
+
+
+class ToolParseBilibiliConfig(ToolInfoBaseConfig):
+    """B站解析工具（parse_bilibili_video）。"""
+
+    __ui_label__ = "parse_bilibili_video"
+
+
+class ToolParseDouyinConfig(ToolInfoBaseConfig):
+    """抖音解析工具（parse_douyin_video）。"""
+
+    __ui_label__ = "parse_douyin_video"
+
+
+def _collect_tool_info(handler: Any) -> Dict[str, str]:
+    """从组件声明生成单个工具的展示字段（可见性 / 描述 / 参数）。"""
+    info = getattr(handler, "__maibot_component_info__", None)
+    if info is None:
+        return {}
+    metadata = getattr(info, "metadata", None)
+    visibility = ""
+    if isinstance(metadata, dict):
+        visibility = str(metadata.get("visibility") or "").strip()
+    description = str(
+        getattr(info, "brief_description", "") or getattr(info, "description", "") or ""
+    ).strip() or "（无描述）"
+    parameters = getattr(info, "parameters", None) or []
+    param_lines: List[str] = []
+    for param in parameters:
+        param_name = str(getattr(param, "name", "") or "")
+        param_type = getattr(param, "param_type", None)
+        type_text = (
+            getattr(param_type, "value", None)
+            or getattr(param_type, "name", None)
+            or "string"
+        )
+        required = "必填" if bool(getattr(param, "required", False)) else "可选"
+        param_desc = str(getattr(param, "description", "") or "")
+        param_lines.append(f"{param_name}（{type_text}，{required}）: {param_desc}")
+    return {
+        "visibility": visibility or "deferred（未显式声明时的宿主默认）",
+        "description": description,
+        "parameters": "\n".join(param_lines) if param_lines else "（无参数）",
+    }
+
+
+def _collect_all_tool_info() -> Dict[str, Dict[str, str]]:
+    """收集全部工具的展示字段（段名 → 字段字典；加载同步与 Scheme 注入共用）。"""
+    return {
+        "tool_inspect_image": _collect_tool_info(RelookMixin.handle_inspect_image),
+        "tool_parse_bilibili_video": _collect_tool_info(VideoMixin.tool_parse_bilibili_video),
+        "tool_parse_douyin_video": _collect_tool_info(VideoMixin.tool_parse_douyin_video),
+    }
+
+
+def _sync_component_info_sections(
+    values: Dict[str, Dict[str, str]], config_path: Optional[Path] = None
+) -> None:
+    """把组件信息展示字段写入 config.toml 对应段（每段内容有变化才写）。
+
+    实现与 reply-control 一致：段内容完全由本函数管理（整段重写），文本用
+    JSON 转义（TOML 基础字符串兼容）；失败静默（不影响插件运行）。
+    """
+    if not values:
+        return
+    try:
+        target = config_path or (Path(__file__).parent / "config.toml")
+        if not target.exists():
+            return
+        content = target.read_text(encoding="utf-8")
+        original = content
+        for section, fields in values.items():
+            if not fields:
+                continue
+            body = [
+                f"{name} = " + json.dumps(value, ensure_ascii=False)
+                for name, value in fields.items()
+            ]
+            content = _replace_section_body(content, section, body)
+        if content != original:
+            target.write_text(content, encoding="utf-8")
+    except Exception:
+        pass  # 展示同步失败不影响插件运行
+
+
+def _replace_section_body(content: str, section: str, body: List[str]) -> str:
+    """重写 TOML 指定段的段体（段不存在时追加）；内容未变化时原样返回。"""
+    lines = content.splitlines()
+    start: Optional[int] = None
+    end = len(lines)
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == f"[{section}]":
+            start = index
+            continue
+        if start is not None and stripped.startswith("[") and stripped.endswith("]"):
+            end = index
+            break
+    trailing = "\n" if content.endswith("\n") else ""
+    if start is None:
+        suffix = "" if content.endswith("\n") else "\n"
+        return f"{content}{suffix}\n[{section}]\n" + "\n".join(body) + "\n"
+    current = [line for line in lines[start + 1 : end] if line.strip()]
+    if current == body:
+        return content  # 未变化：不写盘、不触发配置事件
+    if end >= len(lines):
+        return "\n".join([*lines[: start + 1], *body]) + trailing
+    return "\n".join([*lines[: start + 1], *body, "", *lines[end:]]) + trailing
+
+
 class VisualEnhanceConfig(PluginConfigBase):
     """插件根配置。"""
 
@@ -77,6 +235,15 @@ class VisualEnhanceConfig(PluginConfigBase):
     debug: DebugSectionConfig = Field(
         default_factory=DebugSectionConfig, json_schema_extra={"label": "调试"}
     )
+    tool_inspect_image: ToolInspectImageConfig = Field(
+        default_factory=ToolInspectImageConfig
+    )
+    tool_parse_bilibili_video: ToolParseBilibiliConfig = Field(
+        default_factory=ToolParseBilibiliConfig
+    )
+    tool_parse_douyin_video: ToolParseDouyinConfig = Field(
+        default_factory=ToolParseDouyinConfig
+    )
 
 
 class VisualEnhancePlugin(StoryboardMixin, RelookMixin, VideoMixin, MaiBotPlugin):
@@ -89,6 +256,9 @@ class VisualEnhancePlugin(StoryboardMixin, RelookMixin, VideoMixin, MaiBotPlugin
     async def on_load(self) -> None:
         await super().on_load()
         await self._video_on_load()
+        # 工具信息只读展示：WebUI 取值依赖配置值本身，加载时同步一次
+        # （内容有变化才写盘；纯展示字段，读取处忽略）
+        _sync_component_info_sections(_collect_all_tool_info())
 
     async def on_unload(self) -> None:
         await self._video_on_unload()
@@ -135,9 +305,32 @@ class VisualEnhancePlugin(StoryboardMixin, RelookMixin, VideoMixin, MaiBotPlugin
                         "sections": ["parse", "credential"],
                         "order": 5,
                     },
-                    {"id": "debug", "title": "调试", "sections": ["debug"], "order": 6},
+                    {
+                        "id": "debug",
+                        "title": "调试",
+                        "sections": [
+                            "debug",
+                            "tool_inspect_image",
+                            "tool_parse_bilibili_video",
+                            "tool_parse_douyin_video",
+                        ],
+                        "order": 6,
+                    },
                 ],
             }
+            # 工具信息卡：各段字段 default 注入（双保险；框内值由 on_load 写入配置值）
+            sections_map = schema.get("sections") or {}
+            for section_name, fields in _collect_all_tool_info().items():
+                section = sections_map.get(section_name)
+                if not isinstance(section, dict):
+                    continue
+                section_fields = section.get("fields")
+                if not isinstance(section_fields, dict):
+                    continue
+                for field_name, value in fields.items():
+                    field = section_fields.get(field_name)
+                    if isinstance(field, dict):
+                        field["default"] = value
         return schema
 
 

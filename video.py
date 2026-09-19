@@ -5,7 +5,9 @@ LICENSE）。凭据仅支持在配置里手填 Cookie，不依赖 Command / 二�
 
 - ``chat.receive.after_process`` Hook（BLOCKING）：自动检测入站消息中的
   B 站或抖音视频链接，把视频信息、章节要点与官方 AI 总结附加到消息内容末尾
-  （写入上下文历史），**不主动发送任何回复**；
+  （写入上下文历史），**不主动发送任何回复**；并按配置去掉链接的分享参数
+  （``?share_source=…&vd_source=…`` 等，缩短聊天上下文；抖音 ``modal_id``
+  形态的视频 ID 在参数里，自动保留原样）；
 - ``parse_bilibili_video`` / ``parse_douyin_video`` Tool：供 planner 按需
   显式解析指定的视频。
 
@@ -53,6 +55,57 @@ _DOUYIN_WEB_PATTERN = re.compile(
 )
 _DOUYIN_MODAL_PATTERN = re.compile(r"[?&]modal_id=(\d+)", re.IGNORECASE)
 
+# ============ 链接精简（去分享参数） ============
+# 匹配「带参数的完整视频 URL」：参数部分限定 URL-safe 字符，遇中文标点（。，、！等）
+# 即停——避免把链接后的中文标点吃掉。仅在链接确实带 ? 参数时改写（原文无参数不动）。
+_QUERY_CHARS = r"[0-9A-Za-z=&%_\-\.~\+/]*"
+_BILI_URL_TAIL_PATTERN = re.compile(
+    r"(?:https?://)?(?:www\.|m\.)?bilibili\.com/video/(?P<vid>BV[0-9A-Za-z]{10}|av\d+)/?(?:\?"
+    + _QUERY_CHARS
+    + r")?",
+    re.IGNORECASE,
+)
+_DOUYIN_URL_TAIL_PATTERN = re.compile(
+    r"(?:https?://)?(?:www\.|m\.)?douyin\.com/(?P<kind>video|note)/(?P<vid>\d+)/?(?:\?"
+    + _QUERY_CHARS
+    + r")?",
+    re.IGNORECASE,
+)
+_SHORT_URL_TAIL_PATTERN = re.compile(
+    r"(?:https?://)?(?:www\.)?(?P<host>b23\.tv|bili2233\.cn)/(?P<code>[0-9A-Za-z\-_]+)/?(?:\?"
+    + _QUERY_CHARS
+    + r")?",
+    re.IGNORECASE,
+)
+
+
+def _strip_share_query(text: str) -> str:
+    """去掉视频链接的分享参数（仅当链接带 ``?`` 参数时改写；无参数原样保留）。
+
+    - B站：``bilibili.com/video/BV…/?share_source=…&vd_source=…`` → 规范短链；
+    - 抖音：``douyin.com/video/123?…`` → 去参数（ID 在路径里）；``modal_id``
+      形态（ID 在参数里）不匹配本正则，保持原样；
+    - b23.tv / bili2233.cn 短链：去参数（短码在路径，跳转不受影响）。
+    """
+    def _compact(match: re.Match[str], canonical: str) -> str:
+        raw = match.group(0)
+        return canonical if "?" in raw else raw
+
+    def _bili(match: re.Match[str]) -> str:
+        return _compact(match, f"https://www.bilibili.com/video/{match.group('vid')}")
+
+    def _douyin(match: re.Match[str]) -> str:
+        return _compact(
+            match, f"https://www.douyin.com/{match.group('kind').lower()}/{match.group('vid')}"
+        )
+
+    def _short(match: re.Match[str]) -> str:
+        return _compact(match, f"https://{match.group('host').lower()}/{match.group('code')}")
+
+    text = _BILI_URL_TAIL_PATTERN.sub(_bili, text)
+    text = _DOUYIN_URL_TAIL_PATTERN.sub(_douyin, text)
+    return _SHORT_URL_TAIL_PATTERN.sub(_short, text)
+
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 _IOS_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
 
@@ -96,6 +149,14 @@ class ParseSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "私聊附加",
             "hint": "开=私聊出现视频链接时，把信息附加到上下文（不主动回复）",
+        },
+    )
+    strip_share_query: bool = Field(
+        default=True,
+        description="精简视频链接：去掉分享参数（share_source / vd_source 等），缩短聊天上下文",
+        json_schema_extra={
+            "label": "精简链接",
+            "hint": "开（默认）=自动去掉视频链接的分享尾巴（如 ?share_source=copy_web&vd_source=…），上下文更短、链接照常可打开；B站去 ? 后参数；抖音只处理 ID 在路径里的直链（modal_id 形态自动保留）；关=原文不动",
         },
     )
     cache_ttl_seconds: int = Field(
@@ -588,7 +649,9 @@ class VideoMixin:
         duration = _format_duration(info.get("duration", 0))
         ai_summary = (info.get("ai_summary") or "").strip()
 
-        lines = [f"[B站视频信息: 《{title}》 | UP: {up} | 时长: {duration}]"]
+        lines = [
+            f"[B站视频信息（已自动解析，无需调用解析工具）: 《{title}》 | UP: {up} | 时长: {duration}]"
+        ]
         if ai_summary:
             lines.append(f"[B站官方AI总结]: {ai_summary}")
         elif info.get("desc"):
@@ -936,7 +999,9 @@ class VideoMixin:
         chapter_abstract = (info.get("chapter_abstract") or "").strip()
         ai_summary = (info.get("ai_summary") or "").strip()
 
-        lines = [f"[抖音视频信息: 《{title}》 | 作者: @{author} | 时长: {duration}]"]
+        lines = [
+            f"[抖音视频信息（已自动解析，无需调用解析工具）: 《{title}》 | 作者: @{author} | 时长: {duration}]"
+        ]
         if highlights:
             lines.append("[高光片段]:")
             for h in highlights:
@@ -1012,7 +1077,9 @@ class VideoMixin:
         description="检测入站消息中的B站/抖音视频链接并将AI总结直接附加到消息内容中",
         mode=HookMode.BLOCKING,
         order=HookOrder.NORMAL,
-        timeout_ms=10000,
+        # 30s：B站需「信息+AI总结」两次请求、抖音最多三次，慢网络下 10s 会超时——
+        # 超时即注入静默丢失（消息照常入队但没有视频信息，模型只好去调工具）
+        timeout_ms=30000,
         error_policy=ErrorPolicy.SKIP,
     )
     async def inject_bilibili_summary(self, **kwargs: Any) -> dict[str, Any]:
@@ -1047,6 +1114,16 @@ class VideoMixin:
         if target is None:
             return {"action": "continue"}
 
+        # 精简链接：去掉分享参数（独立于信息获取——即使后续获取失败，改写也保留）
+        link_compacted = False
+        if cfg.strip_share_query:
+            link_compacted = self._compact_message_links(message)
+            if link_compacted:
+                self.ctx.logger.info(
+                    "[视觉增强·视频理解] 已精简消息 %s 的视频链接（去分享参数）",
+                    message.get("message_id"),
+                )
+
         summary_block = ""
         platform_kind, arg1 = target[0], target[1]
         if platform_kind in ("bvid", "aid"):
@@ -1056,20 +1133,18 @@ class VideoMixin:
                     summary_block = self._build_injected_summary(info)
             except Exception as exc:  # noqa: BLE001
                 self._dbg("[视频理解] 获取B站视频总结异常: %s", exc)
-                return {"action": "continue"}
-        elif platform_kind == "douyin":
-            if not cfg.enable_douyin:
-                return {"action": "continue"}
+        elif platform_kind == "douyin" and cfg.enable_douyin:
             try:
                 info = await self._fetch_douyin_video_info(str(arg1))
                 if info:
                     summary_block = self._build_injected_douyin_summary(info)
             except Exception as exc:  # noqa: BLE001
                 self._dbg("[视频理解] 获取抖音视频总结异常: %s", exc)
-                return {"action": "continue"}
 
         if not summary_block:
-            return {"action": "continue"}
+            if not link_compacted:
+                return {"action": "continue"}
+            return {"action": "continue", "modified_kwargs": {"message": message}}
 
         got_summary = bool(str((info or {}).get("ai_summary") or "").strip())
         self.ctx.logger.info(
@@ -1095,6 +1170,33 @@ class VideoMixin:
             },
         }
 
+    def _compact_message_links(self, message: dict[str, Any]) -> bool:
+        """去掉消息中视频链接的分享参数（返回是否发生改写）。
+
+        ``processed_plain_text`` 与 ``raw_message`` 的文本段同步改写，避免出现
+        「文本已短、原始组件仍长」的不一致；非文本段（图片等）零接触。
+        """
+        changed = False
+        plain = message.get("processed_plain_text")
+        if isinstance(plain, str) and plain:
+            compacted = _strip_share_query(plain)
+            if compacted != plain:
+                message["processed_plain_text"] = compacted
+                changed = True
+        raw_msg = message.get("raw_message")
+        if isinstance(raw_msg, list):
+            for seg in raw_msg:
+                if not isinstance(seg, dict) or seg.get("type") != "text":
+                    continue
+                data = seg.get("data")
+                if not isinstance(data, str) or not data:
+                    continue
+                compacted = _strip_share_query(data)
+                if compacted != data:
+                    seg["data"] = compacted
+                    changed = True
+        return changed
+
     # ------------------------------------------------------------------ #
     # Tool: 供 planner 显式调用
     # ------------------------------------------------------------------ #
@@ -1102,9 +1204,10 @@ class VideoMixin:
     @Tool(
         "parse_bilibili_video",
         description=(
-            "解析B站视频并获取B站官方AI视频总结。当聊天中出现B站视频链接、BV号、"
-            "b23.tv短链，或有人提到想看/讨论某个B站视频时，调用此工具获取视频标题、"
-            "UP主、时长、播放数据和AI总结，帮助你理解视频内容并参与讨论。"
+            "解析B站视频并获取B站官方AI视频总结。注意：当前聊天消息中的 B 站链接/BV号"
+            "已由系统自动解析并附在消息末尾（标注「已自动解析」）——这种情况无需调用本工具；"
+            "仅当消息中没有附带解析信息（如视频在更早的历史消息里）、自动解析失败或需要"
+            "重新解析时才调用，获取视频标题、UP主、时长、播放数据和AI总结。"
         ),
         parameters=[
             ToolParameterInfo(
@@ -1135,9 +1238,10 @@ class VideoMixin:
     @Tool(
         "parse_douyin_video",
         description=(
-            "解析抖音视频并获取抖音官方AI视频总结、高光片段与章节要点。当聊天中出现抖音视频链接、"
-            "v.douyin.com 短链、分享口令文本，或有人提到想了解某个抖音视频内容时，调用此工具获取视频标题、"
-            "作者、时长、高光片段、章节要点及官方AI总结，帮助你理解视频内容并参与讨论。"
+            "解析抖音视频并获取抖音官方AI视频总结、高光片段与章节要点。注意：当前聊天消息中的"
+            "抖音链接/v.douyin.com 短链已由系统自动解析并附在消息末尾（标注「已自动解析」）——"
+            "这种情况无需调用本工具；仅当消息中没有附带解析信息、自动解析失败或需要重新解析时"
+            "才调用，获取视频标题、作者、时长、高光片段、章节要点及官方AI总结。"
         ),
         parameters=[
             ToolParameterInfo(
