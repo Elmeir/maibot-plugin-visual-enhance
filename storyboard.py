@@ -68,7 +68,7 @@ DHASH_DUPLICATE_DISTANCE = 6
 ANIMETRACE_API_URL = "https://api.animetrace.com/v1/search"
 """AnimeTrace 识图接口（ai.animedb.cn 页面对应的官方 API）。"""
 
-ANIME_KEYWORDS_DEFAULT = "动漫,动画,番剧,二次元,漫画,卡通,插画,分镜,动图,角色,anime,アニメ,動漫,動畫"
+ANIME_KEYWORDS_DEFAULT = "动漫,动画,番剧,二次元,漫画,卡通,插画,角色,anime,アニメ,動漫,動畫"
 """动漫触发关键词默认表：描述命中任一才调用识图接口。"""
 
 ANIME_INFO_MARKER = "[动漫角色识别]"
@@ -1888,8 +1888,8 @@ class StoryboardMixin:
     def _caption_text(count: int, has_cjk: bool) -> str:
         """说明条文案：极简锚点 + 时序连播提示，帮助视觉模型把跨帧动作连成因果。"""
         if has_cjk:
-            return f"动图分镜 · 共 {count} 帧（按序号连播）"
-        return f"Storyboard: {count} frames, play in order"
+            return f"帧序列 · 共 {count} 帧（按序号连播）"
+        return f"Frame sequence: {count} frames, play in order"
 
     # ── 生命周期 ────────────────────────────────────────────────────────
 
